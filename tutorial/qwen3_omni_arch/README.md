@@ -44,6 +44,255 @@ Qwen3-Omni-MoE 的实现分布在 4 层目录，20+ 个核心文件中：
 
 ---
 
+## Layer 0: Pipeline 注册与解析机制
+
+在进入 4 层实现之前，首先需要理解："用户启动一个模型 → vLLM-Omni 怎么知道该加载几个 stage、每个 stage 是什么类型？"
+
+答案是一套**声明式 Pipeline 注册表 + 运行时解析器**机制。
+
+### 0.1 核心概念：`PipelineConfig` 是什么
+
+[`PipelineConfig`](../../vllm_omni/config/stage_config.py#L243) 是一个 **frozen dataclass**，描述了一个模型的多阶段拓扑：
+
+```python
+@dataclass(frozen=True)
+class PipelineConfig:
+    model_type: str                              # 注册表 key
+    model_arch: str                              # 模型类名
+    stages: tuple[StagePipelineConfig, ...]      # 每个 stage 的定义
+    default_deploy_config_name: str              # 对应的 deploy YAML 文件名
+    hf_architectures: tuple[str, ...]            # HF config 架构别名（可选）
+    endpoint_restrictions: tuple[EndpointRestriction, ...]  # 端点限制（可选）
+    extras: dict[str, Any]                       # 模型级额外配置（可选）
+```
+
+每个 stage 用 [`StagePipelineConfig`](../../vllm_omni/config/stage_config.py#L184) 声明：
+
+```python
+@dataclass(frozen=True)
+class StagePipelineConfig:
+    stage_id: int                                # 从 0 开始
+    model_stage: str                             # "thinker" / "talker" / "code2wav"
+    execution_type: StageExecutionType           # LLM_AR 或 LLM_GENERATION 或 DIFFUSION
+    input_sources: tuple[int, ...]               # 上游 stage ids，空元组表示首 stage
+    final_output: bool                           # 是否为终端 stage
+    final_output_type: str                       # "text" / "audio" / "image" / "video"
+    owns_tokenizer: bool                         # 谁持有 tokenizer
+    requires_multimodal_data: bool               # 是否需要多模态输入
+    hf_config_name: str                          # 对应 HF 子 config
+    engine_output_type: str                      # "latent" / "text" / "audio" / "token_ids"
+    # inter-stage 桥接函数（字符串引用，运行时动态 import）
+    custom_process_next_stage_input_func: str    # 全量同步路径
+    async_chunk_process_next_stage_input_func: str  # async_chunk 路径
+    sync_process_input_func: str                 # 同步 placeholder 构建器
+    sampling_constraints: dict                   # 采样约束
+```
+
+### 0.2 注册表：`OMNI_PIPELINES`
+
+**文件**：[`vllm_omni/config/pipeline_registry.py`](../../vllm_omni/config/pipeline_registry.py)
+
+所有模型在 `OMNI_PIPELINES` 这个全局字典中注册，key 是模型的 `model_type` 字符串，value 可以是：
+
+- **静态 `PipelineConfig`** — 直接存配置实例（大多数模型）
+- **resolver 函数** — 存一个可调用对象，运行时根据 HF config **动态返回** `PipelineConfig`（Qwen3-Omni 等需要区分变体的模型）
+
+```python
+OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "minicpmo_4_5": MINICPMO_4_5_PIPELINE,       # 静态：一种配置
+    "qwen3_omni_moe": resolve_qwen3_omni_pipeline, # 动态：resolve 函数
+    ...
+}
+```
+
+**运行时解析**（[`resolve_pipeline_config`](../../vllm_omni/config/pipeline_registry.py#L172)）：
+
+```python
+def resolve_pipeline_config(model_type, hf_config=None):
+    pipeline = OMNI_PIPELINES[model_type]
+    return pipeline(hf_config) if callable(pipeline) else pipeline
+    #      ↑                                          ↑
+    #   如果是函数 → 调用(hf_config) 动态解析           如果是值 → 直接返回
+```
+
+### 0.3 为什么 Qwen3-Omni 需要 resolver：同一 `model_type`，两种变体
+
+Qwen3-Omni-MoE 的 HF config `model_type` 始终是 `"qwen3_omni_moe"`，但其在 HuggingFace 上有两种变体：
+
+| 模型变体 | `enable_audio_output` | 需要的 stage |
+|---|---|---|
+| Qwen3-Omni-30B-A3B-**Instruct** | `True` | thinker + talker + code2wav (3) |
+| Qwen3-Omni-30B-A3B-**Captioner** | `False` | thinker only (1) |
+
+Captioner 变体只有理解能力，不需要语音生成，用 3-stage pipeline 会浪费显存加载用不到的 talker/code2wav。因此注册的不是静态配置而是 resolver 函数。
+
+### 0.4 `@pipeline_cfg_resolver` 装饰器工厂
+
+**源码**：[`stage_config.py:33-45`](../../vllm_omni/config/stage_config.py#L33)
+
+```python
+def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
+    """装饰器工厂：返回一个装饰器，给 resolver 加上 typesafe guard"""
+
+    def resolver_builder(func):                # ① 这是真正的装饰器
+        @functools.wraps(func)
+        def wrapper(hf_config):               # ② 被包装后的 resolver
+            if hf_config is None or not isinstance(hf_config, config_type):
+                return None                   # ③ 类型不匹配 → 静默返回 None
+            return func(hf_config)            # ④ 类型匹配 → 调用原始函数
+
+        return wrapper
+
+    return resolver_builder                   # ⑤ 返回装饰器
+```
+
+这是一个**装饰器工厂**（返回装饰器的函数）。它的工作原理：
+
+```
+@pipeline_cfg_resolver(config_type=Qwen3OmniMoeConfig)  # 步骤1: 调用工厂，传入 config_type
+def resolve_qwen3_omni_pipeline(hf_config):              # 步骤2: 工厂返回的 resolver_builder
+    ...                                                   #         作为装饰器接收 func
+                                                          # 步骤3: 结果 wrapper 替代原函数
+```
+
+等价于：
+
+```python
+# 原始函数
+def resolve_qwen3_omni_pipeline(hf_config): ...
+
+# 装饰后
+resolve_qwen3_omni_pipeline = pipeline_cfg_resolver(Qwen3OmniMoeConfig)(resolve_qwen3_omni_pipeline)
+#                              \________________________/                \________________________/
+#                              ① 调用工厂, config_type 被闭包捕获          ② func 被闭包捕获
+#                              返回 resolver_builder                     作为参数传入
+```
+
+最终 `wrapper` 闭包捕获了两个变量：
+
+```
+wrapper(hf_config):
+    ↑ 运行时参数       闭包:
+                       ├── func = 原始 resolve_qwen3_omni_pipeline
+                       └── config_type = Qwen3OmniMoeConfig
+```
+
+### 0.5 `resolve_qwen3_omni_pipeline` 的逻辑
+
+**源码**：[`pipeline.py:98-110`](../../vllm_omni/model_executor/models/qwen3_omni/pipeline.py#L98)
+
+```python
+@pipeline_cfg_resolver(config_type=Qwen3OmniMoeConfig)
+def resolve_qwen3_omni_pipeline(
+    hf_config: Qwen3OmniMoeConfig,
+) -> PipelineConfig:
+    """Select the right pipeline variant based on the HF config."""
+    if not hf_config.enable_audio_output:
+        return QWEN3_OMNI_THINKER_ONLY_PIPELINE   # Captioner: 只起 thinker
+    return QWEN3_OMNI_PIPELINE                     # Instruct: 起 3 个 stage
+```
+
+函数逻辑非常简单：看 `hf_config.enable_audio_output` 的值来决定走哪个 pipeline。
+
+`@functools.wraps(func)` 保留原函数的 `__name__`、`__doc__` 等信息，否则 `resolve_qwen3_omni_pipeline.__name__` 会变成 `"wrapper"`。
+
+### 0.6 `isinstance` guard 的作用
+
+如果注册表查询错误地把 `LlamaConfig` 传给了 Qwen3-Omni 的 resolver：
+
+```python
+# 无 guard:
+resolve_qwen3_omni_pipeline(llama_config)
+# → llama_config 没有 enable_audio_output → AttributeError 💥
+
+# 有 guard:
+resolve_qwen3_omni_pipeline(llama_config)
+# → isinstance(llama_config, Qwen3OmniMoeConfig) == False → return None ✅
+```
+
+返回 `None` 后，上游调用方可以尝试下一个候选 resolver 或报明确错误，而非崩溃。
+
+### 0.7 完整启动流程
+
+```
+用户启动: vllm-omni serve Qwen3-Omni-30B-A3B-Instruct
+  │
+  ├─① HF: AutoConfig.from_pretrained()
+  │    返回 Qwen3OmniMoeConfig(model_type="qwen3_omni_moe", enable_audio_output=True)
+  │
+  ├─② StageConfigFactory 调用 resolve_pipeline_config("qwen3_omni_moe", hf_config)
+  │    → OMNI_PIPELINES["qwen3_omni_moe"] = resolve_qwen3_omni_pipeline (是函数)
+  │    → callable ✅ → resolve_qwen3_omni_pipeline(hf_config)
+  │       → wrapper(hf_config):
+  │           isinstance(hf_config, Qwen3OmniMoeConfig) ✅
+  │           → func(hf_config):
+  │               enable_audio_output == True
+  │               → return QWEN3_OMNI_PIPELINE  (3 stages)
+  │
+  ├─③ 根据 PipelineConfig 构建 StageConfig:
+  │    stage 0: thinker  → 加载 on GPU 0
+  │    stage 1: talker   → 加载 on GPU 1
+  │    stage 2: code2wav → 加载 on GPU 1
+  │
+  ├─④ 加载 deploy/qwen3_omni_moe.yaml:
+  │    async_chunk=true, max_num_seqs=64, enforce_eager=false
+  │    → 合并到每个 stage 配置
+  │
+  └─⑤ 创建 OmniChunkTransferAdapter + SharedMemoryConnector → 启动 3 个 engine
+```
+
+如果是 Captioner 变体：
+
+```
+Qwen3-Omni-30B-A3B-Captioner:
+  Qwen3OmniMoeConfig(enable_audio_output=False)
+    → resolve_qwen3_omni_pipeline(hf_config)
+       → enable_audio_output == False
+       → return QWEN3_OMNI_THINKER_ONLY_PIPELINE (1 stage)
+  → 只加载 thinker，省下 talker + code2wav 的显存
+```
+
+### 0.8 如何为新模型注册 Pipeline
+
+在源码中分为两种方式：
+
+**方式一：静态配置（模型只有一种变体，如 MiniCPM-o 4.5）**
+
+1. 在 `pipeline.py` 中定义 `PipelineConfig` 实例
+2. 在 [`pipeline_registry.py`](../../vllm_omni/config/pipeline_registry.py) 中 `import` 并添加一行映射
+
+```python
+from ...minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+OMNI_PIPELINES = {
+    "minicpmo_4_5": MINICPMO_4_5_PIPELINE,  # 直接引用实例
+}
+```
+
+**方式二：动态解析（模型有多种变体，如 Qwen3-Omni）**
+
+1. 在 `pipeline.py` 中定义多个 `PipelineConfig` 实例
+2. 实现一个 resolver 函数，用 `@pipeline_cfg_resolver` 装饰
+3. 在 `pipeline_registry.py` 中注册 resolver 函数
+
+```python
+from ...qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
+OMNI_PIPELINES = {
+    "qwen3_omni_moe": resolve_qwen3_omni_pipeline,  # 注册函数而非实例
+}
+```
+
+**方式三：外部注册（out of tree）**
+
+[`register_pipeline()`](../../vllm_omni/config/pipeline_registry.py#L150) 支持在仓库外部动态注册，用于私有模型：
+
+```python
+from vllm_omni.config.pipeline_registry import register_pipeline
+register_pipeline(my_pipeline_config)              # 静态配置
+register_pipeline(my_resolver_func, "my_model")    # 动态 resolver
+```
+
+---
+
 ## Layer 1: 模型实现层（7 个源文件）
 
 目录：[`vllm_omni/model_executor/models/qwen3_omni/`](../../vllm_omni/model_executor/models/qwen3_omni/)
