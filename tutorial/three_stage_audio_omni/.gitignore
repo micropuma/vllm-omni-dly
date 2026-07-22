@@ -1,0 +1,2 @@
+# Keep the checked-in input example while generated output WAV files stay ignored.
+!assets/input.wav
