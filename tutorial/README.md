@@ -9,6 +9,8 @@
 | [`three_stage_audio_omni/`](three_stage_audio_omni/) | Qwen3-Omni-30B-A3B-Instruct | 真实 WAV、文本 -> 文本、语音 | Thinker -> Talker -> Code2Wav 三阶段 Omni 推理 |
 | [`single_gpu_bagel_img2img/`](single_gpu_bagel_img2img/) | BAGEL-7B-MoT | 图片、编辑指令 -> 图片 | 单张 GPU 上的 Thinker -> DiT 两阶段图生图 |
 
+| [minicpmo45_dual_5090/](minicpmo45_dual_5090/) | MiniCPM-o-4_5 | 文本、图片或音频 -> 文本、语音 | RTX 5090 x2 的源码构建与 Thinker -> Talker -> Token2Wav |
+
 ## 环境
 
 ```bash
