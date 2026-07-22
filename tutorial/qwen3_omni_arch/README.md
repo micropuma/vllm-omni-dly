@@ -44,252 +44,364 @@ Qwen3-Omni-MoE 的实现分布在 4 层目录，20+ 个核心文件中：
 
 ---
 
-## Layer 0: Pipeline 注册与解析机制
+## Chapter 0: 从一条命令到多 Stage 协同运行的完整链路
 
-在进入 4 层实现之前，首先需要理解："用户启动一个模型 → vLLM-Omni 怎么知道该加载几个 stage、每个 stage 是什么类型？"
-
-答案是一套**声明式 Pipeline 注册表 + 运行时解析器**机制。
-
-### 0.1 核心概念：`PipelineConfig` 是什么
-
-[`PipelineConfig`](../../vllm_omni/config/stage_config.py#L243) 是一个 **frozen dataclass**，描述了一个模型的多阶段拓扑：
-
-```python
-@dataclass(frozen=True)
-class PipelineConfig:
-    model_type: str                              # 注册表 key
-    model_arch: str                              # 模型类名
-    stages: tuple[StagePipelineConfig, ...]      # 每个 stage 的定义
-    default_deploy_config_name: str              # 对应的 deploy YAML 文件名
-    hf_architectures: tuple[str, ...]            # HF config 架构别名（可选）
-    endpoint_restrictions: tuple[EndpointRestriction, ...]  # 端点限制（可选）
-    extras: dict[str, Any]                       # 模型级额外配置（可选）
+```
+vllm omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni
 ```
 
-每个 stage 用 [`StagePipelineConfig`](../../vllm_omni/config/stage_config.py#L184) 声明：
+这一条命令背后，vLLM-Omni 经历了 **10 个阶段**，横跨 CLI → 配置解析 → Stage 编排 → 进程启动 → 通信器装配：
 
-```python
-@dataclass(frozen=True)
-class StagePipelineConfig:
-    stage_id: int                                # 从 0 开始
-    model_stage: str                             # "thinker" / "talker" / "code2wav"
-    execution_type: StageExecutionType           # LLM_AR 或 LLM_GENERATION 或 DIFFUSION
-    input_sources: tuple[int, ...]               # 上游 stage ids，空元组表示首 stage
-    final_output: bool                           # 是否为终端 stage
-    final_output_type: str                       # "text" / "audio" / "image" / "video"
-    owns_tokenizer: bool                         # 谁持有 tokenizer
-    requires_multimodal_data: bool               # 是否需要多模态输入
-    hf_config_name: str                          # 对应 HF 子 config
-    engine_output_type: str                      # "latent" / "text" / "audio" / "token_ids"
-    # inter-stage 桥接函数（字符串引用，运行时动态 import）
-    custom_process_next_stage_input_func: str    # 全量同步路径
-    async_chunk_process_next_stage_input_func: str  # async_chunk 路径
-    sync_process_input_func: str                 # 同步 placeholder 构建器
-    sampling_constraints: dict                   # 采样约束
+```
+CLI 解析 → AsyncOmniEngine → 注册表查 Pipeline →
+→ PipelineConfig + DeployYAML 合并成 StageConfig
+→ 计算 Replica 布局 → 构建 VllmConfig → 派生 EngineCore 子进程
+→ 建立 ZMQ 连接 → 装配 StagePool + Connector → Orchestrator 启动事件循环
 ```
 
-### 0.2 注册表：`OMNI_PIPELINES`
+本章以 Qwen3-Omni-MoE 为实例，逐阶段拆解。
 
-**文件**：[`vllm_omni/config/pipeline_registry.py`](../../vllm_omni/config/pipeline_registry.py)
+---
 
-所有模型在 `OMNI_PIPELINES` 这个全局字典中注册，key 是模型的 `model_type` 字符串，value 可以是：
+### 阶段 1: CLI → AsyncOmniEngine
 
-- **静态 `PipelineConfig`** — 直接存配置实例（大多数模型）
-- **resolver 函数** — 存一个可调用对象，运行时根据 HF config **动态返回** `PipelineConfig`（Qwen3-Omni 等需要区分变体的模型）
+**入口**：[`cli/serve.py:86`](../../vllm_omni/entrypoints/cli/serve.py#L86)
+
+```python
+class OmniServeCommand:
+    def cmd(self, args):
+        uvloop.run(omni_run_server(args))
+```
+
+`omni_run_server()` → `build_async_omni_from_stage_config()` → `AsyncOmniEngine(model=..., **kwargs)`。
+
+[`AsyncOmniEngine.__init__`](../../vllm_omni/engine/async_omni_engine.py#L213) 是整个初始化的总控制器，它依次执行：
+
+```python
+def __init__(self, model, **kwargs):
+    # ① 解析 endpoint 限制
+    self.endpoint_restrictions = StageConfigFactory.get_pipeline_endpoint_restrictions(...)
+
+    # ② 解析所有 stage 配置（Pipeline + Deploy YAML 合并）
+    self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+
+    # ③ 拉起 orchestrator 后台线程
+    self.orchestrator_thread = threading.Thread(
+        target=self._bootstrap_orchestrator, daemon=True
+    )
+    self.orchestrator_thread.start()
+```
+
+---
+
+### 阶段 2: HF Config 加载 + model_type 推断
+
+**文件**：[`config_factory.py:107`](../../vllm_omni/config/config_factory.py#L107)
+
+`StageConfigFactory.try_infer_model_type()` 加载模型的 `config.json`，读取 `model_type`。支持多种回退策略：
+
+1. `AutoConfig.from_pretrained(model).model_type`（标准）
+2. 直接读 `config.json` 文件（HF 报错时的回退）
+3. 读 `model_index.json`（Diffusers 格式）
+4. 用模型路径的 basename 匹配 pipeline key（最后手段）
+
+对于 Qwen3-Omni，返回 `"qwen3_omni_moe"`。
+
+---
+
+### 阶段 3: 注册表查 PipelineConfig
+
+**文件**：[`pipeline_registry.py:102-147`](../../vllm_omni/config/pipeline_registry.py#L102)
+
+所有模型的 Pipeline 在一个全局字典中注册：
 
 ```python
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
-    "minicpmo_4_5": MINICPMO_4_5_PIPELINE,       # 静态：一种配置
-    "qwen3_omni_moe": resolve_qwen3_omni_pipeline, # 动态：resolve 函数
+    "minicpmo_4_5":  MINICPMO_4_5_PIPELINE,        # 静态配置
+    "qwen3_omni_moe": resolve_qwen3_omni_pipeline,  # 动态 resolver 函数
     ...
 }
 ```
 
-**运行时解析**（[`resolve_pipeline_config`](../../vllm_omni/config/pipeline_registry.py#L172)）：
+**为什么 value 有两种类型？**
+
+- **静态 `PipelineConfig`**：模型只有一种拓扑（如 MiniCPM-o 固定 2 stage），直接用实例
+- **resolver 函数**：同一个 `model_type` 有多个变体（如 Qwen3-Omni Instruct vs Captioner），需要根据 HF config 动态选择
+
+[`resolve_pipeline_config()`](../../vllm_omni/config/pipeline_registry.py#L172) 分派：
 
 ```python
 def resolve_pipeline_config(model_type, hf_config=None):
     pipeline = OMNI_PIPELINES[model_type]
     return pipeline(hf_config) if callable(pipeline) else pipeline
-    #      ↑                                          ↑
-    #   如果是函数 → 调用(hf_config) 动态解析           如果是值 → 直接返回
 ```
 
-### 0.3 为什么 Qwen3-Omni 需要 resolver：同一 `model_type`，两种变体
-
-Qwen3-Omni-MoE 的 HF config `model_type` 始终是 `"qwen3_omni_moe"`，但其在 HuggingFace 上有两种变体：
-
-| 模型变体 | `enable_audio_output` | 需要的 stage |
-|---|---|---|
-| Qwen3-Omni-30B-A3B-**Instruct** | `True` | thinker + talker + code2wav (3) |
-| Qwen3-Omni-30B-A3B-**Captioner** | `False` | thinker only (1) |
-
-Captioner 变体只有理解能力，不需要语音生成，用 3-stage pipeline 会浪费显存加载用不到的 talker/code2wav。因此注册的不是静态配置而是 resolver 函数。
-
-### 0.4 `@pipeline_cfg_resolver` 装饰器工厂
-
-**源码**：[`stage_config.py:33-45`](../../vllm_omni/config/stage_config.py#L33)
-
-```python
-def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
-    """装饰器工厂：返回一个装饰器，给 resolver 加上 typesafe guard"""
-
-    def resolver_builder(func):                # ① 这是真正的装饰器
-        @functools.wraps(func)
-        def wrapper(hf_config):               # ② 被包装后的 resolver
-            if hf_config is None or not isinstance(hf_config, config_type):
-                return None                   # ③ 类型不匹配 → 静默返回 None
-            return func(hf_config)            # ④ 类型匹配 → 调用原始函数
-
-        return wrapper
-
-    return resolver_builder                   # ⑤ 返回装饰器
-```
-
-这是一个**装饰器工厂**（返回装饰器的函数）。它的工作原理：
-
-```
-@pipeline_cfg_resolver(config_type=Qwen3OmniMoeConfig)  # 步骤1: 调用工厂，传入 config_type
-def resolve_qwen3_omni_pipeline(hf_config):              # 步骤2: 工厂返回的 resolver_builder
-    ...                                                   #         作为装饰器接收 func
-                                                          # 步骤3: 结果 wrapper 替代原函数
-```
-
-等价于：
-
-```python
-# 原始函数
-def resolve_qwen3_omni_pipeline(hf_config): ...
-
-# 装饰后
-resolve_qwen3_omni_pipeline = pipeline_cfg_resolver(Qwen3OmniMoeConfig)(resolve_qwen3_omni_pipeline)
-#                              \________________________/                \________________________/
-#                              ① 调用工厂, config_type 被闭包捕获          ② func 被闭包捕获
-#                              返回 resolver_builder                     作为参数传入
-```
-
-最终 `wrapper` 闭包捕获了两个变量：
-
-```
-wrapper(hf_config):
-    ↑ 运行时参数       闭包:
-                       ├── func = 原始 resolve_qwen3_omni_pipeline
-                       └── config_type = Qwen3OmniMoeConfig
-```
-
-### 0.5 `resolve_qwen3_omni_pipeline` 的逻辑
-
-**源码**：[`pipeline.py:98-110`](../../vllm_omni/model_executor/models/qwen3_omni/pipeline.py#L98)
+对于 `"qwen3_omni_moe"`，`pipeline` 是 `resolve_qwen3_omni_pipeline` 函数：
 
 ```python
 @pipeline_cfg_resolver(config_type=Qwen3OmniMoeConfig)
-def resolve_qwen3_omni_pipeline(
-    hf_config: Qwen3OmniMoeConfig,
-) -> PipelineConfig:
-    """Select the right pipeline variant based on the HF config."""
+def resolve_qwen3_omni_pipeline(hf_config):
     if not hf_config.enable_audio_output:
-        return QWEN3_OMNI_THINKER_ONLY_PIPELINE   # Captioner: 只起 thinker
-    return QWEN3_OMNI_PIPELINE                     # Instruct: 起 3 个 stage
+        return QWEN3_OMNI_THINKER_ONLY_PIPELINE  # Captioner: 1 stage
+    return QWEN3_OMNI_PIPELINE                    # Instruct: 3 stage
 ```
 
-函数逻辑非常简单：看 `hf_config.enable_audio_output` 的值来决定走哪个 pipeline。
+`@pipeline_cfg_resolver` 是一个**装饰器工厂**（[源码 `stage_config.py:33`](../../vllm_omni/config/stage_config.py#L33)），自动加上 `isinstance(hf_config, Qwen3OmniMoeConfig)` 类型守卫：类型不匹配时静默返回 `None`，避免错误 config 传入导致 `AttributeError`。
 
-`@functools.wraps(func)` 保留原函数的 `__name__`、`__doc__` 等信息，否则 `resolve_qwen3_omni_pipeline.__name__` 会变成 `"wrapper"`。
+**两种变体的结果**：
 
-### 0.6 `isinstance` guard 的作用
+| 模型变体 | `enable_audio_output` | 返回的 Pipeline |
+|---|---|---|
+| Instruct | `True` | `QWEN3_OMNI_PIPELINE`（3 stage：thinker+talker+code2wav） |
+| Captioner | `False` | `QWEN3_OMNI_THINKER_ONLY_PIPELINE`（1 stage：thinker only） |
 
-如果注册表查询错误地把 `LlamaConfig` 传给了 Qwen3-Omni 的 resolver：
+---
+
+### 阶段 4: PipelineConfig + DeployYAML → StageConfig（核心合并）
+
+**文件**：[`merge_pipeline_deploy`](../../vllm_omni/config/stage_config.py#L834)
+
+这是整个配置系统的核心。它把三种来源的信息合并成每个 stage 的最终运行配置：
+
+```
+PipelineConfig    (pipeline.py — 声明"有几个 stage、每个 stage 是什么类型")
+    +
+DeployConfig      (deploy/*.yaml — 声明"每个 stage 用几张 GPU、max_num_seqs 多少")
+    +
+CLI overrides     (--stage-overrides '{"0.max_num_seqs":8}')
+    ↓
+list[StageConfig] (每个 stage 一份，包含 engine_args + runtime 所有字段)
+```
+
+合并逻辑对每个 `StagePipelineConfig`（来自 pipeline）执行：
+
+```
+For each StagePipelineConfig (ps):
+
+  ① _resolve_execution_mode()
+     LLM_AR → (StageType.LLM, "ar")
+     LLM_GENERATION → (StageType.LLM, "generation")
+     DIFFUSION → (StageType.DIFFUSION, None)
+
+  ② _select_processor_funcs()
+     根据 async_chunk 挑选正确的 inter-stage 处理函数：
+     async_chunk=true  → async_chunk_process_next_stage_input_func
+     async_chunk=false → custom_process_next_stage_input_func
+
+  ③ _build_engine_args()
+     三层覆盖（由低到高优先级）：
+       PipelineConfig 全局默认 (trust_remote_code, dtype, quantization...)
+         → 对应 stage 的 StageDeployConfig 值 (max_num_seqs, gpu_memory_utilization, devices...)
+           → engine_extras 透传
+
+  ④ _resolve_scheduler()
+     LLM_AR + async_scheduling → OmniARAsyncScheduler
+     LLM_AR + no_async         → OmniARScheduler
+     LLM_GENERATION             → OmniGenerationScheduler
+     DIFFUSION                  → None (diffusion 独立调度)
+
+  ⑤ _build_extras()
+     合并 default_sampling_params（YAML）+ sampling_constraints（pipeline，高优先级）
+     吸附 output_connectors / input_connectors / prompt_expand_func
+
+  ⑥ 创建 StageConfig 实例
+```
+
+生成的 `StageConfig` 实例被 [`to_omegaconf()`](../../vllm_omni/config/stage_config.py#L939) 序列化为 OmegaConf 字典，供引擎初始化使用。
+
+---
+
+### 阶段 5: Deploy YAML 加载（继承 + 平台覆盖）
+
+**文件**：[`load_deploy_config`](../../vllm_omni/config/stage_config.py#L605)
+
+Deploy YAML 支持两个重要特性：
+
+**特性 A: `base_config` 继承**
+```yaml
+base_config: qwen3_omni_moe.yaml  # 继承默认配置
+stages:
+  - stage_id: 1
+    max_num_seqs: 8               # 只覆盖 stage 1 的 max_num_seqs
+```
+
+[`resolve_deploy_yaml()`](../../vllm_omni/config/stage_config.py#L579) 递归加载 base_config，按 `stage_id` deep-merge。
+
+**特性 B: 平台覆盖**
+```yaml
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        devices: "0,1,2,3"       # NPU 上 thinker 用 4 卡
+  rocm:
+    stages:
+      - stage_id: 2
+        enforce_eager: true       # ROCm 上 code2wav 不走 CUDA graph
+```
+
+[`_apply_platform_overrides()`](../../vllm_omni/config/stage_config.py#L660) 在合并前应用当前平台的覆盖。
+
+加载结果是一个 [`DeployConfig`](../../vllm_omni/config/stage_config.py#L338)，包含 `async_chunk`、`connectors`、`platforms`、`edges` 和 `list[StageDeployConfig]`。
+
+---
+
+### 阶段 6: 构建 VllmConfig + 计算 Replica 布局
+
+回到 [`AsyncOmniEngine._bootstrap_orchestrator()`](../../vllm_omni/engine/async_omni_engine.py#L422)，启动 orchestrator 线程后调用 [`_initialize_stages()`](../../vllm_omni/engine/async_omni_engine.py#L364)，进入 [`StageRuntime.initialize()`](../../vllm_omni/engine/stage_runtime.py#L230)：
+
+```
+StageRuntime.initialize()
+  ├── _prepare_stage_plans()
+  │     ├── compute_replica_layout()       # 决定每个 stage 几个副本、落在哪些 GPU
+  │     ├── load_omni_transfer_config_for_model()  # 读取 connectors: / edges: 配置
+  │     └── _build_logical_stage_init_plans()
+  │           For each stage:
+  │             ├── extract_stage_metadata()     # model_stage, engine_output_type...
+  │             ├── get_stage_connector_spec()   # async_chunk 的 connector 配置
+  │             ├── resolve_omni_kv_config()     # AR↔DiT KV 传输配置
+  │             ├── build_engine_args_dict()     # 组装 OmniEngineArgs
+  │             └── build_vllm_config()          # 创建 VllmConfig + executor_class
+  │           For each replica:
+  │             生成 ReplicaInitPlan(metadata, device, vllm_config, executor_class)
+  │
+  ├── _initialize_stage_replicas()
+  │     (按 GPU 分组并行初始化，同 GPU 内串行)
+  │     └── _initialize_local_llm_replica()
+  │           ├── launch_stage_replica()    # 派生 EngineCore 子进程
+  │           └── make_async_mp_client()    # 建立 ZMQ 连接到子进程
+  │
+  └── _finalize_initialized_stages()
+        └── _assemble_stage_pools()
+              └── StagePool(stage_idx, clients, output_processor, vllm_config)
+```
+
+**关键决策**：
+
+1. **Replica 布局**：`compute_replica_layout()` 根据每个 stage 声明的 `devices` 和 `data_parallel_size` 计算需要多少个 EngineCore 副本，分布到哪些 GPU 上
+2. **VllmConfig 构建**：`build_vllm_config()` 从 `OmniEngineArgs` 创建，这是 vLLM 原生 `VllmConfig` 的超集（包含 `model_stage`、`hf_config_name`、`stage_id`、`engine_output_type` 等 omni 扩展字段）
+3. **Connector spec 注入**：`get_stage_connector_spec()` 从 deploy YAML 的 `connectors:` 段读取 connector 类型和参数，注入到 engine args 中
+
+---
+
+### 阶段 7: EngineCore 子进程派生 + ZMQ 连接
+
+[`launch_stage_replica()`](../../vllm_omni/engine/stage_runtime.py#L568) 通过 vLLM 的 executor 框架派生 EngineCore 子进程。子进程内：
+
+- 根据 `vllm_config.model_config.model_stage` 初始化对应的模型子模块（thinker/talker/code2wav）
+- 创建 Scheduler（`OmniARAsyncScheduler` 等）
+- 加载权重
+- 创建 ZMQ socket 暴露通信端点
+
+父进程通过 [`make_async_mp_client()`](../../vllm_omni/engine/stage_runtime.py#L591) 建立 ZMQ 连接，返回 [`StageEngineCoreClientBase`](../../vllm_omni/engine/stage_engine_core_client.py) 实例。
+
+每个 EngineCore 子进程独立运行：
+```
+GPU 0: EngineCore(stage_id=0, model_stage="thinker")
+GPU 1: EngineCore(stage_id=1, model_stage="talker")   ← 同 GPU 不同进程
+GPU 1: EngineCore(stage_id=2, model_stage="code2wav")  ← 同 GPU 不同进程
+```
+
+---
+
+### 阶段 8: StagePool + Connector 装配 + Orchestrator 启动
+
+[`_assemble_stage_pools()`](../../vllm_omni/engine/stage_runtime.py#L683) 聚合每个 stage 的多个 EngineCore 客户端：
 
 ```python
-# 无 guard:
-resolve_qwen3_omni_pipeline(llama_config)
-# → llama_config 没有 enable_audio_output → AttributeError 💥
-
-# 有 guard:
-resolve_qwen3_omni_pipeline(llama_config)
-# → isinstance(llama_config, Qwen3OmniMoeConfig) == False → return None ✅
+StagePool(
+    stage_idx=0,
+    clients=[client_0, ...],                       # 该 stage 的所有 ZMQ 客户端
+    output_processor=MultimodalOutputProcessor(),   # 输出格式转换器
+    stage_vllm_config=thinker_vllm_config,
+)
 ```
 
-返回 `None` 后，上游调用方可以尝试下一个候选 resolver 或报明确错误，而非崩溃。
-
-### 0.7 完整启动流程
-
-```
-用户启动: vllm-omni serve Qwen3-Omni-30B-A3B-Instruct
-  │
-  ├─① HF: AutoConfig.from_pretrained()
-  │    返回 Qwen3OmniMoeConfig(model_type="qwen3_omni_moe", enable_audio_output=True)
-  │
-  ├─② StageConfigFactory 调用 resolve_pipeline_config("qwen3_omni_moe", hf_config)
-  │    → OMNI_PIPELINES["qwen3_omni_moe"] = resolve_qwen3_omni_pipeline (是函数)
-  │    → callable ✅ → resolve_qwen3_omni_pipeline(hf_config)
-  │       → wrapper(hf_config):
-  │           isinstance(hf_config, Qwen3OmniMoeConfig) ✅
-  │           → func(hf_config):
-  │               enable_audio_output == True
-  │               → return QWEN3_OMNI_PIPELINE  (3 stages)
-  │
-  ├─③ 根据 PipelineConfig 构建 StageConfig:
-  │    stage 0: thinker  → 加载 on GPU 0
-  │    stage 1: talker   → 加载 on GPU 1
-  │    stage 2: code2wav → 加载 on GPU 1
-  │
-  ├─④ 加载 deploy/qwen3_omni_moe.yaml:
-  │    async_chunk=true, max_num_seqs=64, enforce_eager=false
-  │    → 合并到每个 stage 配置
-  │
-  └─⑤ 创建 OmniChunkTransferAdapter + SharedMemoryConnector → 启动 3 个 engine
-```
-
-如果是 Captioner 变体：
-
-```
-Qwen3-Omni-30B-A3B-Captioner:
-  Qwen3OmniMoeConfig(enable_audio_output=False)
-    → resolve_qwen3_omni_pipeline(hf_config)
-       → enable_audio_output == False
-       → return QWEN3_OMNI_THINKER_ONLY_PIPELINE (1 stage)
-  → 只加载 thinker，省下 talker + code2wav 的显存
-```
-
-### 0.8 如何为新模型注册 Pipeline
-
-在源码中分为两种方式：
-
-**方式一：静态配置（模型只有一种变体，如 MiniCPM-o 4.5）**
-
-1. 在 `pipeline.py` 中定义 `PipelineConfig` 实例
-2. 在 [`pipeline_registry.py`](../../vllm_omni/config/pipeline_registry.py) 中 `import` 并添加一行映射
+三个 `StagePool` 被传入 [`Orchestrator.__init__`](../../vllm_omni/engine/orchestrator.py#L212)，Orchestrator 建立两个核心 asyncio 协程：
 
 ```python
-from ...minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
-OMNI_PIPELINES = {
-    "minicpmo_4_5": MINICPMO_4_5_PIPELINE,  # 直接引用实例
-}
+Orchestrator.run():
+    asyncio.gather(
+        self.request_handler(),              # 接收用户请求 → 分发到 Stage 0
+        self.orchestration_output_handler(), # 收集各 stage 输出 → 转发下游 / 返回客户端
+    )
 ```
 
-**方式二：动态解析（模型有多种变体，如 Qwen3-Omni）**
+**Connector 的装配时机**：
 
-1. 在 `pipeline.py` 中定义多个 `PipelineConfig` 实例
-2. 实现一个 resolver 函数，用 `@pipeline_cfg_resolver` 装饰
-3. 在 `pipeline_registry.py` 中注册 resolver 函数
+- **Plan time**（阶段 6）：`load_omni_transfer_config_for_model()` 解析 deploy YAML 的 `connectors:` 和 `edges:` 段，转为 `ConnectorSpec`
+- **Replica init time**：`get_stage_connector_spec()` 提取 connector spec 注入 engine args，EngineCore 子进程据此创建 `OmniChunkTransferAdapter` + connector 实例
+- **Runtime**：Orchestrator 通过 `StagePool` 的 client ZMQ 通道收发数据，connector 在后台线程中负责 stage 间的 chunk 传输
 
-```python
-from ...qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
-OMNI_PIPELINES = {
-    "qwen3_omni_moe": resolve_qwen3_omni_pipeline,  # 注册函数而非实例
-}
+对于 Qwen3-Omni-MoE 的默认配置：
+
+```
+                SharedMemoryConnector
+                      /dev/shm
+    ┌─────────┐  ┌──────────────┐  ┌─────────┐
+    │ Stage 0 │─▶│ ChunkTransfer │─▶│ Stage 1 │  thinker → talker
+    │ thinker │  │   Adapter     │  │ talker  │  (async_chunk)
+    └─────────┘  └──────────────┘  └────┬────┘
+                                        │
+                   SharedMemoryConnector│
+                       /dev/shm         │
+                                ┌──────────────┐  ┌──────────┐
+                                │ ChunkTransfer │─▶│ Stage 2  │ talker → code2wav
+                                │   Adapter     │  │ code2wav │ (async_chunk)
+                                └──────────────┘  └──────────┘
 ```
 
-**方式三：外部注册（out of tree）**
+---
 
-[`register_pipeline()`](../../vllm_omni/config/pipeline_registry.py#L150) 支持在仓库外部动态注册，用于私有模型：
+### 完整 10 阶段总览
 
-```python
-from vllm_omni.config.pipeline_registry import register_pipeline
-register_pipeline(my_pipeline_config)              # 静态配置
-register_pipeline(my_resolver_func, "my_model")    # 动态 resolver
 ```
+vllm omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni
+  │
+  │  阶段 1  CLI 解析 → AsyncOmniEngine.__init__
+  │  阶段 2  HF Config 加载 → model_type="qwen3_omni_moe"
+  │  阶段 3  注册表查找 → resolve_qwen3_omni_pipeline(hf_config)
+  │           enable_audio_output=True → QWEN3_OMNI_PIPELINE (3 stages)
+  │  阶段 4  PipelineConfig + deploy/qwen3_omni_moe.yaml → merge_pipeline_deploy()
+  │           三层覆盖 + 调度器解析 + connector 吸附 → list[StageConfig]
+  │  阶段 5  StageConfig.to_omegaconf() → OmegaConf 字典
+  │  阶段 6  StageRuntime._prepare_stage_plans()
+  │           Replica 布局 + VllmConfig 构建 + connector spec 注入
+  │  阶段 7  StageRuntime._initialize_stage_replicas()
+  │           派生 3 个 EngineCore 子进程 + 建立 ZMQ 连接
+  │  阶段 8  StageRuntime._finalize_initialized_stages()
+  │           装配 StagePool × 3 + MultimodalOutputProcessor
+  │  阶段 9  Orchestrator(stage_pools, queues, ...)
+  │  阶段 10 Orchestrator.run() → request_handler + output_handler 并发运行
+  │
+  ▼
+  Ready to serve
+```
+
+---
+
+### 源码索引
+
+| 阶段 | 关键函数 | 文件与行号 |
+|---|---|---|
+| 1 | `AsyncOmniEngine.__init__` | [`async_omni_engine.py:213`](../../vllm_omni/engine/async_omni_engine.py#L213) |
+| 2 | `StageConfigFactory.try_infer_model_type` | [`config_factory.py:107`](../../vllm_omni/config/config_factory.py#L107) |
+| 3 | `resolve_pipeline_config` | [`pipeline_registry.py:172`](../../vllm_omni/config/pipeline_registry.py#L172) |
+| 3 | `resolve_qwen3_omni_pipeline` | [`pipeline.py:98`](../../vllm_omni/model_executor/models/qwen3_omni/pipeline.py#L98) |
+| 4 | `merge_pipeline_deploy` | [`stage_config.py:834`](../../vllm_omni/config/stage_config.py#L834) |
+| 4 | `_build_engine_args` | [`stage_config.py:760`](../../vllm_omni/config/stage_config.py#L760) |
+| 4 | `_resolve_scheduler` | [`stage_config.py:181`](../../vllm_omni/config/stage_config.py#L181) |
+| 5 | `load_deploy_config` | [`stage_config.py:605`](../../vllm_omni/config/stage_config.py#L605) |
+| 5 | `_apply_platform_overrides` | [`stage_config.py:660`](../../vllm_omni/config/stage_config.py#L660) |
+| 5 | `StageConfig.to_omegaconf` | [`stage_config.py:939`](../../vllm_omni/config/stage_config.py#L939) |
+| 6 | `StageRuntime._prepare_stage_plans` | [`stage_runtime.py:275`](../../vllm_omni/engine/stage_runtime.py#L275) |
+| 6 | `build_vllm_config` | [`stage_init_utils.py:748`](../../vllm_omni/engine/stage_init_utils.py#L748) |
+| 6 | `load_omni_transfer_config_for_model` | [`stage_init_utils.py:1030`](../../vllm_omni/engine/stage_init_utils.py#L1030) |
+| 7 | `launch_stage_replica` | [`stage_runtime.py:568`](../../vllm_omni/engine/stage_runtime.py#L568) |
+| 7 | `make_async_mp_client` | [`stage_runtime.py:591`](../../vllm_omni/engine/stage_runtime.py#L591) |
+| 8 | `_assemble_stage_pools` | [`stage_runtime.py:683`](../../vllm_omni/engine/stage_runtime.py#L683) |
+| 9 | `Orchestrator.__init__` | [`orchestrator.py:212`](../../vllm_omni/engine/orchestrator.py#L212) |
+| 10 | `Orchestrator.run` | [`orchestrator.py:330`](../../vllm_omni/engine/orchestrator.py#L330) |
 
 ---
 
